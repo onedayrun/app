@@ -1,10 +1,11 @@
 import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
 import { createClient } from '@supabase/supabase-js';
 import Stripe from 'stripe';
-import Redis from 'redis';
+import { createClient as createRedisClient } from 'redis';
 import multer from 'multer';
 import multerS3 from 'multer-s3';
 import { S3Client } from '@aws-sdk/client-s3';
@@ -19,7 +20,7 @@ const app = express();
 const prisma = new PrismaClient();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-10-16' });
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
-const redis = Redis.createClient({ url: process.env.REDIS_URL });
+const redis = createRedisClient({ url: process.env.REDIS_URL });
 
 // S3 Configuration
 const s3Client = new S3Client({
@@ -35,10 +36,10 @@ const upload = multer({
   storage: multerS3({
     s3: s3Client as any,
     bucket: process.env.S3_BUCKET!,
-    metadata: (req, file, cb) => {
+    metadata: (req: any, file: any, cb: any) => {
       cb(null, { fieldName: file.fieldname });
     },
-    key: (req, file, cb) => {
+    key: (req: any, file: any, cb: any) => {
       const projectId = (req.params as any).projectId;
       const fileKey = `projects/${projectId}/${Date.now()}-${file.originalname}`;
       cb(null, fileKey);
@@ -62,7 +63,13 @@ const logger = winston.createLogger({
 app.use(helmet());
 app.use(compression());
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+// IMPORTANT: Skip JSON parsing for Stripe webhook to keep raw body
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.originalUrl === '/api/webhooks/stripe') {
+    return next();
+  }
+  return (express.json({ limit: '50mb' }) as any)(req, res, next);
+});
 
 // Rate limiting
 const limiter = rateLimit({
@@ -72,12 +79,12 @@ const limiter = rateLimit({
 app.use('/api/', limiter);
 
 // Health check
-app.get('/health', (req, res) => {
+app.get('/health', (req: Request, res: Response) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
 // Project routes
-app.post('/api/projects', async (req, res) => {
+app.post('/api/projects', async (req: Request, res: Response) => {
   try {
     const auth = (req.headers.authorization || '').split(' ')[1];
     const { data } = await supabase.auth.getUser(auth);
@@ -102,7 +109,7 @@ app.post('/api/projects', async (req, res) => {
   }
 });
 
-app.get('/api/projects/:id', async (req, res) => {
+app.get('/api/projects/:id', async (req: Request, res: Response) => {
   try {
     await redis.connect();
     const cached = await redis.get(`project:${req.params.id}`);
@@ -136,7 +143,7 @@ app.get('/api/projects/:id', async (req, res) => {
   }
 });
 
-app.post('/api/projects/:projectId/files', upload.array('files', 10), async (req, res) => {
+app.post('/api/projects/:projectId/files', upload.array('files', 10), async (req: Request, res: Response) => {
   try {
     const files = req.files as any[];
 
@@ -162,7 +169,7 @@ app.post('/api/projects/:projectId/files', upload.array('files', 10), async (req
   }
 });
 
-app.post('/api/payments/extend', async (req, res) => {
+app.post('/api/payments/extend', async (req: Request, res: Response) => {
   try {
     const { projectId, plan } = req.body as any;
 
@@ -202,8 +209,6 @@ app.post('/api/payments/extend', async (req, res) => {
   }
 });
 
-import type { Request, Response } from 'express';
-import type StripeTypes from 'stripe';
 app.post(
   '/api/webhooks/stripe',
   express.raw({ type: 'application/json' }) as any,
@@ -217,8 +222,8 @@ app.post(
         process.env.STRIPE_WEBHOOK_SECRET!
       );
 
-      if ((event as StripeTypes.Event).type === 'checkout.session.completed') {
-        const session = (event as StripeTypes.Event).data.object as StripeTypes.Checkout.Session;
+      if ((event as Stripe.Event).type === 'checkout.session.completed') {
+        const session = (event as Stripe.Event).data.object as Stripe.Checkout.Session;
         const { projectId, days } = session.metadata!;
 
         await prisma.project.update({
@@ -239,7 +244,7 @@ app.post(
 );
 
 // SVG export endpoint (placeholder)
-app.get('/api/projects/:id/export', async (req, res) => {
+app.get('/api/projects/:id/export', async (req: Request, res: Response) => {
   res.status(501).json({ error: 'Not implemented in this demo' });
 });
 
