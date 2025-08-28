@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import axios from 'axios';
 import * as dotenv from 'dotenv';
 import WebSocket from 'ws';
+import FormData from 'form-data';
 
 const ROOT = path.resolve(__dirname, '..');
 const CWD = ROOT; // docker compose lives at repo root
@@ -14,6 +15,7 @@ if (fs.existsSync(envPath)) dotenv.config({ path: envPath });
 
 const NGINX_PORT = parseInt(process.env.NGINX_PORT || '8087', 10);
 const YJS_PORT = parseInt(process.env.YJS_PORT || '4444', 10);
+const BACKEND_PORT = parseInt(process.env.BACKEND_PORT || '3000', 10);
 const BASE = `http://localhost:${NGINX_PORT}`;
 
 function sh(cmd: string) {
@@ -44,6 +46,13 @@ async function testHealth() {
   }
 }
 
+async function testBackendHealthDirect() {
+  const res = await axios.get(`http://127.0.0.1:${BACKEND_PORT}/health`);
+  if (!(res.status === 200 && res.data?.status === 'healthy')) {
+    throw new Error('Direct backend health failed');
+  }
+}
+
 async function testCreateProject() {
   const res = await axios.post(`${BASE}/api/projects`, { metadata: { from: 'e2e' } }, {
     headers: { 'Content-Type': 'application/json' }
@@ -61,12 +70,27 @@ async function testGetProject(id: string) {
   }
 }
 
+async function testGetProject404() {
+  const url = `${BASE}/api/projects/__does_not_exist__`;
+  try {
+    await axios.get(url);
+    throw new Error('Expected 404 not thrown');
+  } catch (err: any) {
+    if (err?.response?.status !== 404) throw err;
+  }
+}
+
 async function testFrontend() {
   const res = await axios.get(`${BASE}/`, { responseType: 'text' });
   const html: string = res.data;
   if (res.status !== 200 || !html.includes('<!DOCTYPE html>')) {
     throw new Error('Frontend root not served');
   }
+}
+
+async function testExport501() {
+  const res = await axios.get(`${BASE}/api/projects/dummy/export`, { validateStatus: () => true });
+  if (res.status !== 501) throw new Error(`Expected 501, got ${res.status}`);
 }
 
 async function testYjsDirect() {
@@ -81,7 +105,7 @@ async function testYjsDirect() {
       ws.close();
       resolve();
     });
-    ws.on('error', (err) => {
+    ws.on('error', (err: Error) => {
       clearTimeout(to);
       reject(err);
     });
@@ -100,11 +124,35 @@ async function testYjsViaNginx() {
       ws.close();
       resolve();
     });
-    ws.on('error', (err) => {
+    ws.on('error', (err: Error) => {
       clearTimeout(to);
       reject(err);
     });
   });
+}
+
+async function testStripeWebhook400() {
+  const res = await axios.post(`${BASE}/api/webhooks/stripe`, { hello: 'world' }, {
+    headers: { 'Content-Type': 'application/json' },
+    validateStatus: () => true,
+  });
+  if (res.status !== 400) throw new Error(`Expected 400, got ${res.status}`);
+}
+
+async function testUploadFilesOptional(projectId: string) {
+  if (process.env.RUN_S3_TEST !== '1') {
+    console.log('Skipping S3 upload test (set RUN_S3_TEST=1 to enable)');
+    return;
+  }
+  const form = new FormData();
+  form.append('files', Buffer.from('hello world'), { filename: 'hello.txt', contentType: 'text/plain' });
+  const res = await axios.post(`${BASE}/api/projects/${projectId}/files`, form, {
+    headers: form.getHeaders(),
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+    validateStatus: () => true,
+  });
+  if (res.status !== 200) throw new Error(`Upload failed with status ${res.status}`);
 }
 
 async function run() {
@@ -137,13 +185,20 @@ async function run() {
 
   let projectId = '';
   await runTest('Health endpoint', testHealth);
+  await runTest('Backend health (direct)', testBackendHealthDirect);
   await runTest('Frontend root served', testFrontend);
   await runTest('Create project', async () => { projectId = await testCreateProject(); });
   if (projectId) {
     await runTest('Fetch created project', async () => testGetProject(projectId));
   }
+  await runTest('Project 404', testGetProject404);
+  await runTest('Export endpoint 501', testExport501);
+  await runTest('Stripe webhook returns 400 without signature', testStripeWebhook400);
   await runTest('Yjs WebSocket (direct)', testYjsDirect);
   await runTest('Yjs WebSocket (via Nginx)', testYjsViaNginx);
+  if (projectId) {
+    await runTest('Upload file (optional, RUN_S3_TEST=1)', async () => testUploadFilesOptional(projectId));
+  }
 
   const failed = results.filter(r => !r.ok);
   console.log('\nSummary:');
