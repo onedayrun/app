@@ -1,0 +1,50 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Project {
+  id            String        @id @default(cuid())
+  userId        String
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  expiresAt     DateTime
+  isPaid        Boolean       @default(false)
+  metadata      Json?
+  files         File[]
+  collaborators Collaborator[]
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model File {
+  id        String   @id @default(cuid())
+  projectId String
+  name      String
+  size      Int
+  mimeType  String
+  url       String
+  s3Key     String
+  createdAt DateTime @default(now())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+model Collaborator {
+  id        String   @id @default(cuid())
+  projectId String
+  email     String?
+  name      String?
+  role      String   @default("viewer")
+  joinedAt  DateTime @default(now())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@unique([projectId, email])
+}

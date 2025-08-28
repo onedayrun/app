@@ -739,8 +739,13 @@
 
             async initCollaboration() {
                 // Initialize Y.js WebSocket provider for real-time collaboration
+                const stored = localStorage.getItem('YJS_WS_URL');
+                const defaultLocal = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+                    ? 'ws://127.0.0.1:4444'
+                    : 'wss://demos.yjs.dev';
+                const wsUrl = stored || defaultLocal;
                 this.provider = new WebsocketProvider(
-                    'wss://demos.yjs.dev', // In production, use your own WebSocket server
+                    wsUrl,
                     this.id,
                     this.yDoc
                 );
