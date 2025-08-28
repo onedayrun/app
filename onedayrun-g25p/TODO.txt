@@ -1,0 +1,1049 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # Main Node.js/Express backend
+  backend:
+    build: ./backend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/oneday
+      - REDIS_URL=redis://redis:6379
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_REGION=${S3_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./uploads:/app/uploads
+    networks:
+      - oneday-network
+
+  # PostgreSQL database
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=oneday
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - oneday-network
+
+  # Redis for caching and job queue
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - oneday-network
+
+  # Y.js WebSocket server for collaboration
+  yjs-server:
+    build: ./yjs-server
+    ports:
+      - "4444:4444"
+    networks:
+      - oneday-network
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+      - ./frontend/dist:/usr/share/nginx/html
+    depends_on:
+      - backend
+      - yjs-server
+    networks:
+      - oneday-network
+
+  # Background job worker
+  worker:
+    build: ./backend
+    command: npm run worker
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/oneday
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - oneday-network
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  oneday-network:
+    driver: bridge
+
+---
+# backend/Dockerfile
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Install dependencies
+COPY package*.json ./
+RUN npm ci --only=production
+
+# Copy application
+COPY . .
+
+# Build TypeScript
+RUN npm run build
+
+EXPOSE 3000
+
+CMD ["npm", "start"]
+
+---
+# backend/package.json
+{
+  "name": "oneday-backend",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node dist/server.js",
+    "build": "tsc",
+    "dev": "nodemon src/server.ts",
+    "worker": "node dist/worker.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "compression": "^1.7.4",
+    "dotenv": "^16.3.1",
+    "stripe": "^14.10.0",
+    "@supabase/supabase-js": "^2.39.0",
+    "aws-sdk": "^2.1508.0",
+    "redis": "^4.6.11",
+    "bull": "^4.11.5",
+    "pg": "^8.11.3",
+    "prisma": "^5.7.1",
+    "@prisma/client": "^5.7.1",
+    "multer": "^1.4.5-lts.1",
+    "multer-s3": "^3.0.1",
+    "sharp": "^0.33.1",
+    "archiver": "^6.0.1",
+    "svgo": "^3.1.0",
+    "dompurify": "^3.0.6",
+    "jsdom": "^23.0.1",
+    "winston": "^3.11.0",
+    "express-rate-limit": "^7.1.5",
+    "yjs": "^13.6.10",
+    "y-websocket": "^1.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.5",
+    "@types/express": "^4.17.21",
+    "typescript": "^5.3.3",
+    "nodemon": "^3.0.2",
+    "ts-node": "^10.9.2"
+  }
+}
+
+---
+# backend/src/server.ts
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import compression from 'compression';
+import { createClient } from '@supabase/supabase-js';
+import Stripe from 'stripe';
+import Redis from 'redis';
+import multer from 'multer';
+import multerS3 from 'multer-s3';
+import { S3Client } from '@aws-sdk/client-s3';
+import { PrismaClient } from '@prisma/client';
+import winston from 'winston';
+import rateLimit from 'express-rate-limit';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const app = express();
+const prisma = new PrismaClient();
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2023-10-16' });
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
+const redis = Redis.createClient({ url: process.env.REDIS_URL });
+
+// S3 Configuration
+const s3Client = new S3Client({
+  region: process.env.S3_REGION!,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+  },
+});
+
+// Multer S3 upload
+const upload = multer({
+  storage: multerS3({
+    s3: s3Client,
+    bucket: process.env.S3_BUCKET!,
+    metadata: (req, file, cb) => {
+      cb(null, { fieldName: file.fieldname });
+    },
+    key: (req, file, cb) => {
+      const projectId = req.params.projectId;
+      const fileKey = `projects/${projectId}/${Date.now()}-${file.originalname}`;
+      cb(null, fileKey);
+    },
+  }),
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB limit
+});
+
+// Logger
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.json(),
+  transports: [
+    new winston.transports.File({ filename: 'error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'combined.log' }),
+    new winston.transports.Console({ format: winston.format.simple() }),
+  ],
+});
+
+// Middleware
+app.use(helmet());
+app.use(compression());
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+});
+app.use('/api/', limiter);
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+// Project routes
+app.post('/api/projects', async (req, res) => {
+  try {
+    const { user } = await supabase.auth.getUser(req.headers.authorization?.split(' ')[1]);
+    
+    const project = await prisma.project.create({
+      data: {
+        userId: user?.id || 'anonymous',
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours
+        metadata: req.body.metadata || {},
+      },
+    });
+
+    // Set expiration in Redis
+    await redis.setex(`project:${project.id}`, 86400, JSON.stringify(project));
+
+    res.json(project);
+  } catch (error) {
+    logger.error('Error creating project:', error);
+    res.status(500).json({ error: 'Failed to create project' });
+  }
+});
+
+app.get('/api/projects/:id', async (req, res) => {
+  try {
+    // Try cache first
+    const cached = await redis.get(`project:${req.params.id}`);
+    if (cached) {
+      return res.json(JSON.parse(cached));
+    }
+
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+      include: { files: true },
+    });
+
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    // Check if expired
+    if (project.expiresAt < new Date()) {
+      return res.status(410).json({ error: 'Project has expired' });
+    }
+
+    // Cache for 1 hour
+    await redis.setex(`project:${req.params.id}`, 3600, JSON.stringify(project));
+
+    res.json(project);
+  } catch (error) {
+    logger.error('Error fetching project:', error);
+    res.status(500).json({ error: 'Failed to fetch project' });
+  }
+});
+
+// File upload
+app.post('/api/projects/:projectId/files', upload.array('files', 10), async (req, res) => {
+  try {
+    const files = req.files as Express.MulterS3.File[];
+    
+    const fileRecords = await Promise.all(
+      files.map(file =>
+        prisma.file.create({
+          data: {
+            projectId: req.params.projectId,
+            name: file.originalname,
+            size: file.size,
+            mimeType: file.mimetype,
+            url: file.location,
+            s3Key: file.key,
+          },
+        })
+      )
+    );
+
+    res.json(fileRecords);
+  } catch (error) {
+    logger.error('Error uploading files:', error);
+    res.status(500).json({ error: 'Failed to upload files' });
+  }
+});
+
+// Payment endpoint
+app.post('/api/payments/extend', async (req, res) => {
+  try {
+    const { projectId, plan } = req.body;
+
+    const prices = {
+      'extend-7': { amount: 499, days: 7 },
+      'extend-30': { amount: 1499, days: 30 },
+      'extend-permanent': { amount: 4999, days: 36500 }, // 100 years
+    };
+
+    const selectedPlan = prices[plan as keyof typeof prices];
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'eur',
+            product_data: {
+              name: `OneDay.run Project Extension - ${selectedPlan.days} days`,
+              description: `Extend project ${projectId} for ${selectedPlan.days} days`,
+            },
+            unit_amount: selectedPlan.amount,
+          },
+          quantity: 1,
+        },
+      ],
+      mode: 'payment',
+      success_url: `${process.env.FRONTEND_URL}/project/${projectId}?payment=success`,
+      cancel_url: `${process.env.FRONTEND_URL}/project/${projectId}?payment=cancelled`,
+      metadata: {
+        projectId,
+        days: selectedPlan.days.toString(),
+      },
+    });
+
+    res.json({ sessionUrl: session.url });
+  } catch (error) {
+    logger.error('Error creating payment session:', error);
+    res.status(500).json({ error: 'Failed to create payment session' });
+  }
+});
+
+// Stripe webhook
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature']!;
+
+  try {
+    const event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET!
+    );
+
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object as Stripe.Checkout.Session;
+      const { projectId, days } = session.metadata!;
+
+      await prisma.project.update({
+        where: { id: projectId },
+        data: {
+          expiresAt: new Date(Date.now() + parseInt(days) * 24 * 60 * 60 * 1000),
+          isPaid: true,
+        },
+      });
+
+      // Update Redis cache
+      await redis.del(`project:${projectId}`);
+    }
+
+    res.json({ received: true });
+  } catch (error) {
+    logger.error('Webhook error:', error);
+    res.status(400).send('Webhook Error');
+  }
+});
+
+// SVG export endpoint
+app.get('/api/projects/:id/export', async (req, res) => {
+  try {
+    const project = await prisma.project.findUnique({
+      where: { id: req.params.id },
+      include: { files: true },
+    });
+
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+
+    const svgContent = generateSVGContainer(project);
+    
+    res.setHeader('Content-Type', 'image/svg+xml');
+    res.setHeader('Content-Disposition', `attachment; filename="${project.id}.svg"`);
+    res.send(svgContent);
+  } catch (error) {
+    logger.error('Error exporting project:', error);
+    res.status(500).json({ error: 'Failed to export project' });
+  }
+});
+
+function generateSVGContainer(project: any): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" 
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     xmlns:oneday="https://oneday.run/schema"
+     width="1200" height="800" viewBox="0 0 1200 800">
+    
+    <defs>
+        <oneday:project version="1.0">
+            <oneday:meta>
+                <oneday:id>${project.id}</oneday:id>
+                <oneday:created>${project.createdAt}</oneday:created>
+                <oneday:expires>${project.expiresAt}</oneday:expires>
+                <oneday:isPaid>${project.isPaid}</oneday:isPaid>
+            </oneday:meta>
+            
+            <oneday:files>
+                ${project.files.map((file: any) => `
+                <oneday:file id="${file.id}" type="${file.mimeType}">
+                    <oneday:name>${file.name}</oneday:name>
+                    <oneday:url>${file.url}</oneday:url>
+                    <oneday:size>${file.size}</oneday:size>
+                </oneday:file>
+                `).join('')}
+            </oneday:files>
+        </oneday:project>
+    </defs>
+    
+    <rect width="100%" height="100%" fill="#f9fafb"/>
+    <text x="50" y="50" font-size="24" font-weight="bold">OneDay.run Project: ${project.id}</text>
+</svg>`;
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  logger.info(`Server running on port ${PORT}`);
+});
+
+---
+# backend/prisma/schema.prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Project {
+  id          String    @id @default(cuid())
+  userId      String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  expiresAt   DateTime
+  isPaid      Boolean   @default(false)
+  metadata    Json?
+  files       File[]
+  collaborators Collaborator[]
+  
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model File {
+  id          String    @id @default(cuid())
+  projectId   String
+  name        String
+  size        Int
+  mimeType    String
+  url         String
+  s3Key       String
+  createdAt   DateTime  @default(now())
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  
+  @@index([projectId])
+}
+
+model Collaborator {
+  id          String    @id @default(cuid())
+  projectId   String
+  email       String?
+  name        String?
+  role        String    @default("viewer")
+  joinedAt    DateTime  @default(now())
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  
+  @@index([projectId])
+  @@unique([projectId, email])
+}
+
+---
+# backend/src/worker.ts
+import Bull from 'bull';
+import { PrismaClient } from '@prisma/client';
+import { S3Client, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import winston from 'winston';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const prisma = new PrismaClient();
+const s3Client = new S3Client({
+  region: process.env.S3_REGION!,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+  },
+});
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.json(),
+  transports: [
+    new winston.transports.File({ filename: 'worker.log' }),
+    new winston.transports.Console({ format: winston.format.simple() }),
+  ],
+});
+
+// Create queues
+const cleanupQueue = new Bull('cleanup', process.env.REDIS_URL!);
+const notificationQueue = new Bull('notifications', process.env.REDIS_URL!);
+
+// Process cleanup jobs
+cleanupQueue.process(async (job) => {
+  const { projectId } = job.data;
+  logger.info(`Processing cleanup for project ${projectId}`);
+
+  try {
+    // Get project with files
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      include: { files: true },
+    });
+
+    if (!project) {
+      logger.warn(`Project ${projectId} not found`);
+      return;
+    }
+
+    // Delete files from S3
+    for (const file of project.files) {
+      try {
+        await s3Client.send(
+          new DeleteObjectCommand({
+            Bucket: process.env.S3_BUCKET!,
+            Key: file.s3Key,
+          })
+        );
+        logger.info(`Deleted S3 file: ${file.s3Key}`);
+      } catch (error) {
+        logger.error(`Failed to delete S3 file: ${file.s3Key}`, error);
+      }
+    }
+
+    // Delete project from database
+    await prisma.project.delete({ where: { id: projectId } });
+    logger.info(`Deleted project ${projectId} from database`);
+  } catch (error) {
+    logger.error(`Cleanup failed for project ${projectId}:`, error);
+    throw error;
+  }
+});
+
+// Process notification jobs
+notificationQueue.process(async (job) => {
+  const { type, data } = job.data;
+  
+  switch (type) {
+    case 'expiry-warning':
+      // Send email notification about project expiry
+      logger.info(`Sending expiry warning for project ${data.projectId}`);
+      // Email service integration here
+      break;
+    
+    case 'project-expired':
+      logger.info(`Project ${data.projectId} has expired`);
+      // Schedule cleanup job
+      await cleanupQueue.add({ projectId: data.projectId }, { delay: 7 * 24 * 60 * 60 * 1000 }); // 7 days grace period
+      break;
+  }
+});
+
+// Schedule periodic cleanup check
+async function checkExpiredProjects() {
+  try {
+    const expiredProjects = await prisma.project.findMany({
+      where: {
+        expiresAt: { lte: new Date() },
+        isPaid: false,
+      },
+    });
+
+    for (const project of expiredProjects) {
+      await notificationQueue.add({
+        type: 'project-expired',
+        data: { projectId: project.id },
+      });
+    }
+
+    logger.info(`Checked ${expiredProjects.length} expired projects`);
+  } catch (error) {
+    logger.error('Error checking expired projects:', error);
+  }
+}
+
+// Run cleanup check every hour
+setInterval(checkExpiredProjects, 60 * 60 * 1000);
+
+logger.info('Worker started');
+
+---
+# yjs-server/Dockerfile
+FROM node:18-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY . .
+
+EXPOSE 4444
+
+CMD ["node", "server.js"]
+
+---
+# yjs-server/package.json
+{
+  "name": "yjs-websocket-server",
+  "version": "1.0.0",
+  "main": "server.js",
+  "dependencies": {
+    "ws": "^8.15.0",
+    "y-websocket": "^1.5.0",
+    "yjs": "^13.6.10"
+  }
+}
+
+---
+# yjs-server/server.js
+const WebSocket = require('ws');
+const http = require('http');
+const { setupWSConnection } = require('y-websocket/bin/utils');
+
+const server = http.createServer((request, response) => {
+  response.writeHead(200, { 'Content-Type': 'text/plain' });
+  response.end('Y.js WebSocket Server');
+});
+
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', (conn, req) => {
+  setupWSConnection(conn, req, {
+    gc: true, // Enable garbage collection
+    gcFilter: () => true, // Collect all documents
+  });
+});
+
+const PORT = process.env.PORT || 4444;
+server.listen(PORT, () => {
+  console.log(`Y.js WebSocket server running on port ${PORT}`);
+});
+
+---
+# nginx/nginx.conf
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream backend {
+        server backend:3000;
+    }
+
+    upstream yjs {
+        server yjs-server:4444;
+    }
+
+    server {
+        listen 80;
+        server_name oneday.run;
+
+        # Redirect to HTTPS
+        return 301 https://$server_name$request_uri;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name oneday.run;
+
+        ssl_certificate /etc/nginx/ssl/cert.pem;
+        ssl_certificate_key /etc/nginx/ssl/key.pem;
+
+        # Security headers
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline';" always;
+
+        # Frontend
+        location / {
+            root /usr/share/nginx/html;
+            try_files $uri $uri/ /index.html;
+        }
+
+        # API
+        location /api {
+            proxy_pass http://backend;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host $host;
+            proxy_cache_bypass $http_upgrade;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # WebSocket for Y.js collaboration
+        location /yjs {
+            proxy_pass http://yjs;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # File uploads
+        client_max_body_size 100M;
+    }
+}
+
+---
+# .env.example
+NODE_ENV=production
+PORT=3000
+
+# Database
+DATABASE_URL=postgresql://postgres:password@postgres:5432/oneday
+
+# Redis
+REDIS_URL=redis://redis:6379
+
+# Stripe
+STRIPE_SECRET_KEY=sk_live_xxx
+STRIPE_WEBHOOK_SECRET=whsec_xxx
+
+# Supabase
+SUPABASE_URL=https://xxx.supabase.co
+SUPABASE_ANON_KEY=eyJxxx
+
+# AWS S3
+S3_BUCKET=oneday-projects
+S3_REGION=eu-central-1
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+
+# Frontend
+FRONTEND_URL=https://oneday.run
+
+---
+# Makefile
+.PHONY: help build up down logs shell clean
+
+help:
+	@echo "Available commands:"
+	@echo "  make build   - Build Docker images"
+	@echo "  make up      - Start services"
+	@echo "  make down    - Stop services"
+	@echo "  make logs    - View logs"
+	@echo "  make shell   - Open shell in backend container"
+	@echo "  make clean   - Remove volumes and images"
+
+build:
+	docker-compose build
+
+up:
+	docker-compose up -d
+
+down:
+	docker-compose down
+
+logs:
+	docker-compose logs -f
+
+shell:
+	docker-compose exec backend sh
+
+clean:
+	docker-compose down -v
+	docker system prune -af
+
+# Production deployment with Podman
+podman-build:
+	podman-compose build
+
+podman-up:
+	podman-compose up -d
+
+podman-down:
+	podman-compose down
+
+# Railway deployment
+railway-deploy:
+	railway up
+
+# Migration commands
+migrate:
+	docker-compose exec backend npx prisma migrate deploy
+
+migrate-dev:
+	docker-compose exec backend npx prisma migrate dev
+
+---
+# deployment/railway.toml
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "backend/Dockerfile"
+
+[deploy]
+startCommand = "npm start"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+[[services]]
+name = "oneday-backend"
+port = 3000
+
+[[services]]
+name = "oneday-yjs"
+port = 4444
+
+---
+# electron-app/main.js
+const { app, BrowserWindow, ipcMain, dialog, Menu } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const { autoUpdater } = require('electron-updater');
+
+let mainWindow;
+let currentProject = null;
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1400,
+    height: 900,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js')
+    },
+    icon: path.join(__dirname, 'assets/icon.png'),
+    titleBarStyle: 'hiddenInset'
+  });
+
+  // Load the OneDay.run web app
+  mainWindow.loadURL('https://oneday.run');
+
+  // Create application menu
+  const template = [
+    {
+      label: 'File',
+      submenu: [
+        {
+          label: 'Open Project...',
+          accelerator: 'CmdOrCtrl+O',
+          click: openProject
+        },
+        {
+          label: 'Save Project',
+          accelerator: 'CmdOrCtrl+S',
+          click: saveProject
+        },
+        { type: 'separator' },
+        {
+          label: 'Sync with Cloud',
+          submenu: [
+            { label: 'Google Drive', click: () => syncWithCloud('google-drive') },
+            { label: 'Dropbox', click: () => syncWithCloud('dropbox') },
+            { label: 'OneDrive', click: () => syncWithCloud('onedrive') }
+          ]
+        }
+      ]
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' }
+      ]
+    },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'reload' },
+        { role: 'forceReload' },
+        { role: 'toggleDevTools' },
+        { type: 'separator' },
+        { role: 'actualSize' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' }
+      ]
+    }
+  ];
+
+  const menu = Menu.buildFromTemplate(template);
+  Menu.setApplicationMenu(menu);
+
+  // Auto-updater
+  autoUpdater.checkForUpdatesAndNotify();
+}
+
+async function openProject() {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openFile'],
+    filters: [
+      { name: 'SVG Projects', extensions: ['svg'] },
+      { name: 'JSON Projects', extensions: ['json'] }
+    ]
+  });
+
+  if (!result.canceled && result.filePaths[0]) {
+    const filePath = result.filePaths[0];
+    const content = fs.readFileSync(filePath, 'utf-8');
+    
+    mainWindow.webContents.send('load-project', {
+      path: filePath,
+      content: content
+    });
+    
+    currentProject = {
+      path: filePath,
+      content: content
+    };
+  }
+}
+
+async function saveProject() {
+  if (!currentProject) {
+    const result = await dialog.showSaveDialog(mainWindow, {
+      filters: [
+        { name: 'SVG Project', extensions: ['svg'] },
+        { name: 'JSON Project', extensions: ['json'] }
+      ]
+    });
+
+    if (!result.canceled) {
+      currentProject = { path: result.filePath };
+    }
+  }
+
+  if (currentProject) {
+    mainWindow.webContents.send('request-save');
+  }
+}
+
+function syncWithCloud(provider) {
+  mainWindow.webContents.send('sync-cloud', provider);
+}
+
+// IPC handlers
+ipcMain.handle('save-project-data', async (event, data) => {
+  if (currentProject && currentProject.path) {
+    fs.writeFileSync(currentProject.path, data);
+    return { success: true };
+  }
+  return { success: false, error: 'No project path' };
+});
+
+ipcMain.handle('get-project-path', () => {
+  return currentProject ? currentProject.path : null;
+});
+
+// Auto-save every 5 minutes
+setInterval(() => {
+  if (currentProject) {
+    mainWindow.webContents.send('auto-save');
+  }
+}, 5 * 60 * 1000);
+
+app.whenReady().then(createWindow);
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit();
+  }
+});
+
+app.on('activate', () => {
+  if (BrowserWindow.getAllWindows().length === 0) {
+    createWindow();
+  }
+});
+
+---
+# electron-app/preload.js
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('electronAPI', {
+  on: (channel, callback) => {
+    const validChannels = ['load-project', 'request-save', 'auto-save', 'sync-cloud'];
+    if (validChannels.includes(channel)) {
+      ipcRenderer.on(channel, callback);
+    }
+  },
+  
+  saveProject: (data) => ipcRenderer.invoke('save-project-data', data),
+  getProjectPath: () => ipcRenderer.invoke('get-project-path'),
+  
+  sendSync: (channel, data) => {
+    ipcRenderer.send(channel, data);
+  }
+});
+        
